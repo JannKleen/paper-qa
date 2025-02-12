@@ -28,3 +28,4 @@ jobs:
         with:
           files: dist/*.tar.gz # Upload the `.tar.gz` file as a source distribution
           token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: "dev"

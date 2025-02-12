@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 import tiktoken
 from aviary.core import Message
+from dateutil.parser import parse
 from llmclient import Embeddable, LLMResult
 from pybtex.database import BibliographyData, Entry, Person
 from pybtex.database.input.bibtex import Parser
@@ -586,7 +587,8 @@ class DocDetails(Doc):
                 "month": (
                     None
                     if not data.get("publication_date")
-                    else data["publication_date"].strftime("%b")
+                    else parse(data["publication_date"]).strftime("%b")
+                    # quickfix because this is a string for us
                 ),
                 "doi": data.get("doi"),
                 "url": data.get("doi_url"),

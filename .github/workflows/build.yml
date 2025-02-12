@@ -1,22 +1,30 @@
-name: Publish
+name: Build and Upload Package
 
 on:
-  release:
-    types: [created]
-  workflow_dispatch:
+  - push:
+    branches:
+      - main
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - id: build
-        uses: hynek/build-and-inspect-python-package@v2
-      - name: Download built artifact to dist/
-        uses: actions/download-artifact@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          name: ${{ steps.build.outputs.artifact-name }}
-          path: dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
+          python-version: "3.x"
+
+      - name: Install Build Tools
+        run: python -m pip install --upgrade pip build
+
+      - name: Build Package
+        run: python -m build  # Uses PEP 517 to build the package
+
+      - name: Upload to GitHub Releases
+        uses: softprops/action-gh-release@v2
         with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
+          files: dist/*.tar.gz  # Upload the `.tar.gz` file as a source distribution
+          token: ${{ secrets.GITHUB_TOKEN }}

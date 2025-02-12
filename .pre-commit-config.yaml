@@ -96,7 +96,7 @@ repos:
           - pydantic-settings
           - qdrant-client
           - rich
-          - tantivy
+          #          - tantivy
           - tenacity
           - tiktoken>=0.4.0 # Match pyproject.toml
           - types-setuptools

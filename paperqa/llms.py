@@ -5,7 +5,6 @@ import threading
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import (
-    Awaitable,
     Callable,
     Iterable,
     Sequence,
@@ -14,13 +13,12 @@ from collections.abc import (
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
-from llmclient import (
+from lmi import (
     Embeddable,
     EmbeddingModel,
     EmbeddingModes,
     HybridEmbeddingModel,
     LiteLLMEmbeddingModel,
-    LLMResult,
     SentenceTransformerEmbeddingModel,
     SparseEmbeddingModel,
 )
@@ -45,11 +43,6 @@ try:
     qdrant_installed = True
 except ImportError:
     qdrant_installed = False
-
-PromptRunner = Callable[
-    [dict, Sequence[Callable[[str], None]] | None, str | None],
-    Awaitable[LLMResult],
-]
 
 logger = logging.getLogger(__name__)
 
@@ -378,7 +371,7 @@ class QdrantVectorStore(VectorStore):
 
         if texts_list and not await self._collection_exists():
             params = models.VectorParams(
-                size=len(cast(Sized, texts_list[0].embedding)),
+                size=len(cast("Sized", texts_list[0].embedding)),
                 distance=models.Distance.COSINE,
             )
 

@@ -12,8 +12,7 @@ from uuid import UUID, uuid4
 
 import tiktoken
 from aviary.core import Message
-from dateutil.parser import parse
-from llmclient import Embeddable, LLMResult
+from lmi import Embeddable, LLMResult
 from pybtex.database import BibliographyData, Entry, Person
 from pybtex.database.input.bibtex import Parser
 from pybtex.scanner import PybtexSyntaxError
@@ -31,6 +30,7 @@ from paperqa.utils import (
     encode_id,
     format_bibtex,
     get_citenames,
+    maybe_get_date,
 )
 from paperqa.version import __version__ as pqa_version
 
@@ -110,6 +110,13 @@ class Context(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     context: str = Field(description="Summary of the text with respect to a question.")
+    question: str | None = Field(
+        default=None,
+        description=(
+            "Question that the context is summarizing for. "
+            "Note this can differ from the user query."
+        ),
+    )
     text: Text
     score: int = 5
 
@@ -126,6 +133,13 @@ class PQASession(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     question: str
     answer: str = ""
+    answer_reasoning: str | None = Field(
+        default=None,
+        description=(
+            "Optional reasoning from the LLM. If the LLM does not support reasoning,"
+            " it will be None."
+        ),
+    )
     has_successful_answer: bool | None = Field(
         default=None,
         description=(
@@ -229,6 +243,7 @@ class PQASession(BaseModel):
         self.contexts = [
             Context(
                 context=c.context,
+                question=c.question,
                 score=c.score,
                 text=Text(
                     text="",
@@ -502,7 +517,7 @@ class DocDetails(Doc):
         if authors := data.get("authors"):
             # On 10/29/2024 while indexing 19k PDFs, a provider (unclear which one)
             # returned an author of None. The vast majority of the time authors are str
-            authors = cast(list[str | None], authors)
+            authors = cast("list[str | None]", authors)
             data["authors"] = [
                 a for a in authors if a and a.lower() not in cls.AUTHOR_NAMES_TO_REMOVE
             ]
@@ -586,9 +601,8 @@ class DocDetails(Doc):
                 "pages": data.get("pages"),
                 "month": (
                     None
-                    if not data.get("publication_date")
-                    else parse(data["publication_date"]).strftime("%b")
-                    # quickfix because this is a string for us
+                    if not (maybe_date := maybe_get_date(data.get("publication_date")))
+                    else maybe_date.strftime("%b")
                 ),
                 "doi": data.get("doi"),
                 "url": data.get("doi_url"),
@@ -723,7 +737,8 @@ class DocDetails(Doc):
             PREFER_OTHER = self.publication_date <= other.publication_date
 
         merged_data = {}
-        for field in self.model_fields:
+        # pylint: disable-next=not-an-iterable  # pylint bug: https://github.com/pylint-dev/pylint/issues/10144
+        for field in type(self).model_fields:
             self_value = getattr(self, field)
             other_value = getattr(other, field)
 

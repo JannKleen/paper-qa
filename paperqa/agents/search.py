@@ -7,6 +7,7 @@ import logging
 import os
 import pathlib
 import pickle
+import re
 import warnings
 import zlib
 from collections import Counter
@@ -306,7 +307,7 @@ class SearchIndex:
                 try:
                     async with self.writer() as writer:
                         # Let caller handle commit to allow for batching
-                        writer.add_document(Document.from_dict(index_doc))  # type: ignore[call-arg]
+                        writer.add_document(Document.from_dict(index_doc))
 
                     filehash = self.filehash(index_doc["body"])
                     (await self.index_files)[index_doc["file_location"]] = filehash
@@ -400,9 +401,8 @@ class SearchIndex:
         return None
 
     def clean_query(self, query: str) -> str:
-        for replace in ("*", "[", "]", ":", "(", ")", "{", "}", "~", '"'):
-            query = query.replace(replace, "")
-        return query
+        # SEE: https://regex101.com/r/DoLMoa/3
+        return re.sub(r'[*\[\]:(){}~^><+"\\]', "", query)
 
     async def query(
         self,
@@ -430,7 +430,7 @@ class SearchIndex:
             result
             for result in [
                 await self.get_saved_object(
-                    doc["file_location"][0], keep_filenames=keep_filenames  # type: ignore[index]
+                    doc["file_location"][0], keep_filenames=keep_filenames
                 )
                 for doc in search_index_docs
             ]
@@ -469,8 +469,9 @@ async def maybe_get_manifest(
                     f" file {filename}."
                 )
             logger.debug(
-                f"Found manifest file at {filename}, read {len(file_loc_to_records)} records"
-                f" from it, which maps to {len(file_loc_to_records)} locations."
+                f"Found manifest file at {filename}, read"
+                f" {len(file_loc_to_records)} records from it, which maps to"
+                f" {len(file_loc_to_records)} locations."
             )
         except FileNotFoundError:
             logger.warning(f"Manifest file at {filename} could not be found.")
@@ -684,7 +685,7 @@ async def get_directory_index(  # noqa: PLR0912
             if index_settings.recurse_subdirectories
             else paper_directory.iterdir()
         )
-        if file.suffix in {".txt", ".pdf", ".html"}
+        if file.suffix in {".txt", ".pdf", ".html", ".md"}
     ]
     if len(valid_papers_rel_file_paths) > WARN_IF_INDEXING_MORE_THAN:
         logger.warning(

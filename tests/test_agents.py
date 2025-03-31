@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import importlib
 import itertools
 import json
@@ -10,7 +9,6 @@ import shutil
 import tempfile
 import time
 import zlib
-from copy import deepcopy
 from functools import wraps
 from pathlib import Path
 from typing import cast
@@ -19,11 +17,17 @@ from uuid import uuid4
 
 import ldp.agent
 import pytest
-from aviary.core import Tool, ToolCall, ToolRequestMessage, ToolsAdapter, ToolSelector
+from aviary.core import (
+    Environment,
+    Tool,
+    ToolRequestMessage,
+    ToolsAdapter,
+    ToolSelector,
+)
 from ldp.agent import MemoryAgent, SimpleAgent
 from ldp.graph.memory import Memory, UIndexMemoryModel
 from ldp.graph.ops import OpResult
-from llmclient import CommonLLMNames, EmbeddingModel, MultipleCompletionLLMModel
+from lmi import CommonLLMNames, EmbeddingModel, LiteLLMModel
 from pytest_subtests import SubTests
 from tantivy import Index
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt
@@ -31,6 +35,7 @@ from tenacity import Retrying, retry_if_exception_type, stop_after_attempt
 from paperqa.agents import SearchIndex, agent_query
 from paperqa.agents.env import (
     CLINICAL_STATUS_SEARCH_REGEX_PATTERN,
+    PaperQAEnvironment,
     clinical_trial_status,
     settings_to_tools,
 )
@@ -41,7 +46,6 @@ from paperqa.agents.search import (
     get_directory_index,
     maybe_get_manifest,
 )
-from paperqa.agents.task import GradablePaperQAEnvironment
 from paperqa.agents.tools import (
     ClinicalTrialsSearch,
     Complete,
@@ -56,11 +60,13 @@ from paperqa.docs import Docs
 from paperqa.prompts import CANNOT_ANSWER_PHRASE, CONTEXT_INNER_PROMPT_NOT_DETAILED
 from paperqa.settings import AgentSettings, IndexSettings, Settings
 from paperqa.types import Context, Doc, PQASession, Text
-from paperqa.utils import extract_thought, get_year, md5sum
+from paperqa.utils import encode_id, extract_thought, get_year, md5sum
 
 
 @pytest.mark.asyncio
-async def test_get_directory_index(agent_test_settings: Settings) -> None:
+async def test_get_directory_index(
+    subtests: SubTests, agent_test_settings: Settings
+) -> None:
     # Since agent_test_settings is used by other tests, we use a tempdir so we
     # can delete files without affecting concurrent tests
     with tempfile.TemporaryDirectory() as tempdir:
@@ -83,14 +89,45 @@ async def test_get_directory_index(agent_test_settings: Settings) -> None:
             "year",
         ], "Incorrect fields in index"
         assert not index.changed, "Expected index to not have changes at this point"
-        # paper.pdf + empty.txt + flag_day.html + bates.txt + obama.txt,
+        # bates.txt + empty.txt + flag_day.html + gravity_hill.md + obama.txt + paper.pdf,
         # but empty.txt fails to be added
         path_to_id = await index.index_files
         assert (
-            sum(id_ != FAILED_DOCUMENT_ADD_ID for id_ in path_to_id.values()) == 4
+            sum(id_ != FAILED_DOCUMENT_ADD_ID for id_ in path_to_id.values()) == 5
         ), "Incorrect number of parsed index files"
-        results = await index.query(query="who is Frederick Bates?")
-        assert results[0].docs.keys() == {md5sum((paper_dir / "bates.txt").absolute())}
+
+        with subtests.test(msg="check-txt-query"):
+            results = await index.query(query="who is Frederick Bates?", min_score=5)
+            assert results
+            target_doc_path = (paper_dir / "bates.txt").absolute()
+            assert results[0].docs.keys() == {md5sum(target_doc_path)}, (
+                f"Expected to find {target_doc_path.name!r}, got citations"
+                f" {[d.formatted_citation for d in results[0].docs.values()]}."
+            )
+
+        with subtests.test(msg="check-md-query"):
+            results = await index.query(query="what is a gravity hill?", min_score=5)
+            assert results
+            first_result = results[0]
+            target_doc_path = (paper_dir / "gravity_hill.md").absolute()
+            expected_ids = {
+                md5sum(target_doc_path),  # What we actually expect
+                encode_id(
+                    "10.2307/j.ctt5vkfh7.11"  # Crossref may match this Gravity Hill poem, lol
+                ),
+            }
+            for expected_id in expected_ids:
+                if expected_id in set(first_result.docs.keys()):
+                    break
+            else:
+                raise AssertionError(
+                    f"Failed to match an ID in {expected_ids}, got citations"
+                    f" {[d.formatted_citation for d in first_result.docs.values()]}."
+                )
+            assert all(
+                x in first_result.docs[expected_id].formatted_citation
+                for x in ("Wikipedia", "Gravity")
+            )
 
         # Check getting the same index name will not reprocess files
         with patch.object(Docs, "aadd") as mock_aadd:
@@ -121,7 +158,7 @@ async def test_resuming_crashed_index_build(agent_test_settings: Settings) -> No
     num_source_files = len(
         [
             x
-            for x in cast(Path, index_settings.paper_directory).iterdir()
+            for x in cast("Path", index_settings.paper_directory).iterdir()
             if x.suffix != ".csv"
         ]
     )
@@ -198,6 +235,7 @@ EXPECTED_STUB_DATA_FILES = {
     "bates.txt",
     "empty.txt",
     "flag_day.html",
+    "gravity_hill.md",
     "obama.txt",
     "paper.pdf",
 }
@@ -207,7 +245,7 @@ EXPECTED_STUB_DATA_FILES = {
 async def test_get_directory_index_w_manifest(agent_test_settings: Settings) -> None:
     # Set the paper_directory to be a relative path as starting point to confirm this
     # won't trip us up, and set the manifest file too
-    abs_paper_dir = cast(Path, agent_test_settings.agent.index.paper_directory)
+    abs_paper_dir = cast("Path", agent_test_settings.agent.index.paper_directory)
     agent_test_settings.agent.index.paper_directory = abs_paper_dir.relative_to(
         Path.cwd()
     )
@@ -271,15 +309,16 @@ async def test_get_directory_index_w_no_citations(
 
 @pytest.mark.flaky(reruns=2, only_rerun=["AssertionError", "httpx.RemoteProtocolError"])
 @pytest.mark.parametrize("agent_type", [FAKE_AGENT_TYPE, ToolSelector, SimpleAgent])
+@pytest.mark.parametrize("llm_name", ["gpt-4o", "gemini/gemini-1.5-flash"])
 @pytest.mark.asyncio
 async def test_agent_types(
-    agent_test_settings: Settings, agent_type: str | type
+    agent_test_settings: Settings, agent_type: str | type, llm_name: str
 ) -> None:
     question = "How can you use XAI for chemical property prediction?"
 
     # make sure agent_llm is different from default, so we can correctly track tokens
     # for agent
-    agent_test_settings.agent.agent_llm = "gpt-4o"
+    agent_test_settings.agent.agent_llm = llm_name
     agent_test_settings.llm = "gpt-4o-mini"
     agent_test_settings.summary_llm = "gpt-4o-mini"
     agent_test_settings.agent.agent_prompt += (
@@ -303,10 +342,10 @@ async def test_agent_types(
     # TODO: once LDP can track tokens, we can remove this check
     if agent_type not in {FAKE_AGENT_TYPE, SimpleAgent}:
         assert (
-            response.session.token_counts[agent_llm][0] > 1000
+            response.session.token_counts[agent_llm][0] > 500
         ), "Expected many prompt tokens"
         assert (
-            response.session.token_counts[agent_llm][1] > 50
+            response.session.token_counts[agent_llm][1] > 30
         ), "Expected many completion tokens"
         assert response.session.cost > 0, "Expected nonzero cost"
 
@@ -324,11 +363,11 @@ async def test_successful_memory_agent(agent_test_settings: Settings) -> None:
             " and you have already tried to answer several times,"
             " you can terminate by calling the {complete_tool_name} tool."
             " The current status of evidence/papers/cost is "
-            f"{make_status(total_paper_count=0, relevant_paper_count=0, evidence_count=0, cost=0.0)}"  # Started 0
+            f"{make_status(total_paper_count=0, relevant_paper_count=0, evidence_count=0, cost=0.0)}"  # Started 0  # noqa: E501
             "\n\nTool request message '' for tool calls: paper_search(query='XAI for"
             " chemical property prediction', min_year='2018', max_year='2024')"
             f" [id={memory_id}]\n\nTool response message '"
-            f"{make_status(total_paper_count=2, relevant_paper_count=0, evidence_count=0, cost=0.0)}"  # Found 2
+            f"{make_status(total_paper_count=2, relevant_paper_count=0, evidence_count=0, cost=0.0)}"  # Found 2  # noqa: E501
             f"' for tool call ID {memory_id} of tool 'paper_search'"
         ),
         input=(
@@ -363,7 +402,7 @@ async def test_successful_memory_agent(agent_test_settings: Settings) -> None:
     }
 
     thoughts: list[str] = []
-    orig_llm_model_call = MultipleCompletionLLMModel.call
+    orig_llm_model_call = LiteLLMModel.call
 
     async def on_agent_action(  # noqa: RUF029
         action: OpResult[ToolRequestMessage], *_
@@ -373,12 +412,10 @@ async def test_successful_memory_agent(agent_test_settings: Settings) -> None:
     async def llm_model_call(*args, **kwargs):
         # NOTE: "required" will not lead to thoughts being emitted, it has to be "auto"
         # https://docs.anthropic.com/en/docs/build-with-claude/tool-use#chain-of-thought
-        kwargs.pop("tool_choice", MultipleCompletionLLMModel.TOOL_CHOICE_REQUIRED)
+        args = args[:-1]  # removing last element (tool_choice) from args
         return await orig_llm_model_call(*args, tool_choice="auto", **kwargs)  # type: ignore[misc]
 
-    with patch.object(
-        MultipleCompletionLLMModel, "call", side_effect=llm_model_call, autospec=True
-    ):
+    with patch.object(LiteLLMModel, "call", side_effect=llm_model_call, autospec=True):
         response = await agent_query(
             query,
             agent_test_settings,
@@ -410,7 +447,7 @@ async def test_timeout(agent_test_settings: Settings, agent_type: str | type) ->
     assert CANNOT_ANSWER_PHRASE in response.session.answer
 
 
-@pytest.mark.flaky(reruns=3, only_rerun=["AssertionError"])
+@pytest.mark.flaky(reruns=5, only_rerun=["AssertionError"])
 @pytest.mark.asyncio
 async def test_propagate_options(agent_test_settings: Settings) -> None:
     llm_name = "gpt-4o-mini"
@@ -633,10 +670,27 @@ async def test_agent_sharing_state(
 
         # now adjust to give the agent 2x pieces of evidence
         gather_evidence_tool.settings.agent.agent_evidence_n = 2
+        # also reset the question to ensure that contexts are
+        # only returned to the agent for the new question
+        new_question = "How does XAI relate to a self-explanatory model?"
         response = await gather_evidence_tool.gather_evidence(
-            session.question, state=env_state
+            new_question, state=env_state
         )
-
+        assert len({c.question for c in session.contexts}) == 2, "Expected 2 questions"
+        # now we make sure this is only for the old question
+        for context in session.contexts:
+            if context.question != new_question:
+                assert (
+                    context.context[:20] not in response
+                ), "gather_evidence should not return any contexts for the old question"
+        assert (
+            sum(
+                (1 if (context.context[:20] in response) else 0)
+                for context in session.contexts
+                if context.question == new_question
+            )
+            == 2
+        ), "gather_evidence should only return 2 contexts for the new question"
         split = re.split(
             r"(\d+) pieces of evidence, (\d+) of which were relevant",
             response,
@@ -862,6 +916,7 @@ def test_answers_are_striped() -> None:
         contexts=[
             Context(
                 context="bla",
+                question="foo",
                 text=Text(
                     name="text",
                     text="The meaning of life is 42.",
@@ -885,171 +940,6 @@ def test_answers_are_striped() -> None:
     assert response.session.contexts[0].text.doc.embedding is None
     # make sure it serializes
     response.model_dump_json()
-
-
-@pytest.fixture(name="stub_gradable_env")
-def fixture_stub_gradable_env(
-    agent_test_settings: Settings,
-) -> GradablePaperQAEnvironment:
-    return GradablePaperQAEnvironment(
-        query="How can you use XAI for chemical property prediction?",
-        settings=agent_test_settings,
-        docs=Docs(),
-    )
-
-
-class TestGradablePaperQAEnvironment:
-    @pytest.mark.flaky(reruns=2, only_rerun=["AssertionError"])
-    @pytest.mark.asyncio
-    async def test_deepcopy_env(
-        self,
-        agent_test_settings: Settings,
-        stub_gradable_env: GradablePaperQAEnvironment,
-    ) -> None:
-        await get_directory_index(settings=agent_test_settings)  # Trigger build
-
-        # 1. Rollout until after gather evidence
-        await stub_gradable_env.reset()
-        for tool_call in (
-            ToolCall.from_name(
-                "paper_search",
-                query="XAI for chemical property prediction",
-                min_year=2018,
-                max_year=2024,
-            ),
-            ToolCall.from_name(
-                "gather_evidence", question=cast(str, stub_gradable_env._query)
-            ),
-        ):
-            await stub_gradable_env.step(ToolRequestMessage(tool_calls=[tool_call]))
-
-        # 2. Now we deepcopy the environment
-        stub_gradable_env_copy = deepcopy(stub_gradable_env)
-        assert stub_gradable_env.state == stub_gradable_env_copy.state
-
-        # 3. Generate an answer and complete for both, and confirm they are identical
-        gen_answer_action = ToolRequestMessage(
-            tool_calls=[ToolCall.from_name("gen_answer")]
-        )
-        await stub_gradable_env.step(gen_answer_action)
-        _, _, done, _ = await stub_gradable_env.step(
-            ToolRequestMessage(
-                tool_calls=[ToolCall.from_name("complete", has_successful_answer=True)]
-            )
-        )
-        assert done
-        assert len(stub_gradable_env.state.session.answer) > 10, "Expected an answer"
-        assert stub_gradable_env.state.session.used_contexts
-        await stub_gradable_env_copy.step(gen_answer_action)
-        _, _, done, _ = await stub_gradable_env_copy.step(
-            ToolRequestMessage(
-                tool_calls=[ToolCall.from_name("complete", has_successful_answer=True)]
-            )
-        )
-        assert done
-        assert (
-            len(stub_gradable_env_copy.state.session.answer) > 10
-        ), "Expected an answer"
-        assert stub_gradable_env_copy.state.session.used_contexts
-        assert sorted(stub_gradable_env.state.session.used_contexts) == sorted(
-            stub_gradable_env_copy.state.session.used_contexts
-        )
-        assert stub_gradable_env.state.session.tool_history == (
-            [["paper_search"], ["gather_evidence"], ["gen_answer"], ["complete"]]
-        ), "Correct tool history was not saved in the session."
-        assert stub_gradable_env_copy.state.query_tool_history(
-            "gen_answer"
-        ), "Expected gen_answer tool to be in tool history"
-
-    @pytest.mark.asyncio
-    async def test_empty_tool_calls(
-        self, stub_gradable_env: GradablePaperQAEnvironment
-    ) -> None:
-        await stub_gradable_env.reset()
-        obs, _, done, truncated = await stub_gradable_env.step(ToolRequestMessage())
-        assert len(obs) == 1
-        assert obs[0].content
-        assert "no tool calls" in obs[0].content.lower()
-        assert not done
-        assert not truncated
-
-    @pytest.mark.asyncio
-    async def test_unsure_answer(
-        self,
-        agent_test_settings: Settings,
-        stub_gradable_env: GradablePaperQAEnvironment,
-    ) -> None:
-        unsure_answer = "Based on the sources provided, it appears no one has done x."
-
-        async def emulate_answered_but_unsure(  # noqa: RUF029
-            *_, query: PQASession, **__
-        ) -> PQASession:
-            query.answer = unsure_answer
-            return query
-
-        reset_obs, tools = await stub_gradable_env.reset()
-
-        # 1. Emulate being unsure after gen_answer
-        answer_action = ToolRequestMessage(
-            tool_calls=[ToolCall.from_name("gen_answer")]
-        )
-        with patch.object(
-            type(stub_gradable_env.state.docs), "aquery", emulate_answered_but_unsure
-        ):
-            answer_obs, _, done, truncated = await stub_gradable_env.step(answer_action)
-        assert len(answer_obs) == 1
-        assert answer_obs[0].content
-        assert unsure_answer in answer_obs[0].content
-        assert not done
-        assert not truncated
-
-        # 2. Check this leads to us being unsure
-        complete_action = await agent_test_settings.get_llm().select_tool(
-            [*reset_obs, answer_action, *answer_obs],
-            tools=tools,
-            tool_choice=next(
-                filter(lambda x: x.info.name == Complete.TOOL_FN_NAME, tools)
-            ),
-        )
-        assert len(complete_action.tool_calls) == 1
-        assert complete_action.tool_calls[0].function.arguments == {
-            "has_successful_answer": False
-        }, "Expected unsure"
-
-    @pytest.mark.asyncio
-    async def test_sequential_tool_calls(
-        self, stub_gradable_env: GradablePaperQAEnvironment
-    ) -> None:
-        SLEEP_TIME = 2.0
-
-        async def fake_gather_evidence(*args, **kwargs) -> str:  # noqa: ARG001
-            await asyncio.sleep(SLEEP_TIME)
-            return "fake evidence"
-
-        _, tools = await stub_gradable_env.reset()
-
-        gather_tool = next(
-            tool for tool in tools if tool.info.name == GatherEvidence.TOOL_FN_NAME
-        )
-
-        with patch.object(gather_tool, "_tool_fn", fake_gather_evidence):
-            tic = time.time()
-            await stub_gradable_env.step(
-                ToolRequestMessage(
-                    tool_calls=[
-                        ToolCall.from_name(
-                            "gather_evidence",
-                            question="XAI for chemical property prediction",
-                        ),
-                        ToolCall.from_name(
-                            "gather_evidence",
-                            question="XAI for chemical property prediction",
-                        ),
-                    ]
-                )
-            )
-
-            assert time.time() - tic > 2 * SLEEP_TIME  # since they are sequential
 
 
 @pytest.mark.asyncio
@@ -1169,9 +1059,29 @@ async def test_index_build_concurrency(agent_test_settings: Settings) -> None:
     low_batch_save_count = mock_save_index.call_count
 
     assert high_concurrency_duration * 1.1 < low_concurrency_duration, (
-        f"Expected high concurrency to be faster, but took {high_concurrency_duration:.2f}s "
-        f"compared to {low_concurrency_duration:.2f}s"
+        "Expected high concurrency to be faster, but took"
+        f" {high_concurrency_duration:.2f}s compared to {low_concurrency_duration:.2f}s"
     )
-    assert (
-        high_batch_save_count < low_batch_save_count
-    ), f"Expected fewer save_index with high batch size, but got {high_batch_save_count} vs {low_batch_save_count}"
+    assert high_batch_save_count < low_batch_save_count, (
+        "Expected fewer save_index with high batch size, but got"
+        f" {high_batch_save_count} vs {low_batch_save_count}"
+    )
+
+
+def test_env_from_name(subtests: SubTests) -> None:
+    assert "paperqa" in Environment.available()
+
+    with subtests.test(msg="only-task"):
+        env = Environment.from_name(  # type: ignore[var-annotated]
+            "paperqa", "How can you use XAI for chemical property prediction?"
+        )
+        assert isinstance(env, PaperQAEnvironment)
+
+    with subtests.test(msg="env-kwargs"):
+        env = Environment.from_name(
+            "paperqa",
+            query="How can you use XAI for chemical property prediction?",
+            settings=Settings(),
+            docs=Docs(),
+        )
+        assert isinstance(env, PaperQAEnvironment)

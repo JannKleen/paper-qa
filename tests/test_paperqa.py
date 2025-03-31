@@ -3,7 +3,6 @@ import os
 import pathlib
 import pickle
 import re
-import textwrap
 from collections.abc import AsyncIterable, Sequence
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -14,7 +13,8 @@ from typing import cast
 import httpx
 import numpy as np
 import pytest
-from llmclient import (
+from aviary.core import Message
+from lmi import (
     CommonLLMNames,
     Embeddable,
     EmbeddingModel,
@@ -24,6 +24,8 @@ from llmclient import (
     LLMResult,
     SparseEmbeddingModel,
 )
+from lmi.llms import rate_limited
+from lmi.utils import VCR_DEFAULT_MATCH_ON
 from pytest_subtests import SubTests
 
 from paperqa import (
@@ -48,13 +50,13 @@ from paperqa.readers import read_doc
 from paperqa.utils import (
     extract_score,
     get_citenames,
+    maybe_get_date,
     maybe_is_html,
     maybe_is_text,
     name_in_text,
     strings_similarity,
     strip_citations,
 )
-from tests.conftest import VCR_DEFAULT_MATCH_ON
 
 THIS_MODULE = pathlib.Path(__file__)
 
@@ -74,7 +76,7 @@ def test_get_citations() -> None:
         " hospitalization, and death. The BNT162b2 vaccine has shown effectiveness"
         " ranging from 65% to -41% for the 5-11 years age group and 76% to 46% for the"
         " 12-17 years age group, after the emergence of the Omicron variant in New York"
-        " (Dorabawila2022EffectivenessOT). Against the Delta variant, the effectiveness"
+        " (Dorabawila2022EffectivenessOT). Against the Delta variant, the effectiveness"  # spellchecker: disable-line
         " of the BNT162b2 vaccine was approximately 88% after two doses"
         " (Bernal2021EffectivenessOC pg. 1-3).\n\nVaccine effectiveness was also found"
         " to be 89% against hospitalization and 91% against emergency department or"
@@ -90,7 +92,7 @@ def test_get_citations() -> None:
         " outcomes (Bar2000Foo pg 1-3; Far2000 pg 2-5)."
     )
     ref = {
-        "Dorabawila2022EffectivenessOT",
+        "Dorabawila2022EffectivenessOT",  # spellchecker: disable-line
         "Bernal2021EffectivenessOC pg. 1-3",
         "Thompson2021EffectivenessOC pg. 3-5",
         "Goo2031Foo pg. 3-4",
@@ -375,64 +377,6 @@ def test_extract_score() -> None:
     assert extract_score(sample) == 9
 
 
-@pytest.mark.parametrize(
-    ("example", "expected"),
-    [
-        (
-            """Sure here is the json you asked for!
-
-    {
-    "example": "json"
-    }
-
-    Did you like it?""",
-            {"example": "json"},
-        ),
-        (
-            """
-```json
-{
-    "example": "json"
-}
-```
-
-I have written the json you asked for.""",
-            {"example": "json"},
-        ),
-        (
-            """
-
-{
-    "example": "json"
-}
-
-""",
-            {"example": "json"},
-        ),
-        ('{"example": "\\json"}', {"example": "\\json"}),
-    ],
-)
-def test_llm_parse_json(example: str, expected: dict) -> None:
-    assert llm_parse_json(example) == expected
-
-
-def test_llm_parse_json_newlines() -> None:
-    """Make sure that newlines in json are preserved and escaped."""
-    example = textwrap.dedent(
-        """
-        {
-        "summary": "A line
-
-        Another line",
-        "relevance_score": 7
-        }"""
-    )
-    assert llm_parse_json(example) == {
-        "summary": "A line\n\nAnother line",
-        "relevance_score": 7,
-    }
-
-
 @pytest.mark.asyncio
 async def test_chain_completion() -> None:
     s = Settings(llm="babbage-002", temperature=0.2)
@@ -442,10 +386,12 @@ async def test_chain_completion() -> None:
         outputs.append(x)
 
     llm = s.get_llm()
-    completion = await llm.run_prompt(
-        prompt="The {animal} says",
-        data={"animal": "duck"},
-        system_prompt=None,
+
+    messages = [
+        Message(content="The duck says"),
+    ]
+    completion = await llm.call_single(
+        messages=messages,
         callbacks=[accum],
     )
     assert completion.seconds_to_first_token > 0
@@ -453,8 +399,8 @@ async def test_chain_completion() -> None:
     assert completion.completion_count > 0
     assert str(completion) == "".join(outputs)
 
-    completion = await llm.run_prompt(
-        prompt="The {animal} says", data={"animal": "duck"}, system_prompt=None
+    completion = await llm.call_single(
+        messages=messages,
     )
     assert completion.seconds_to_first_token == 0
     assert completion.seconds_to_last_token > 0
@@ -472,10 +418,11 @@ async def test_anthropic_chain(stub_data_dir: Path) -> None:
         outputs.append(x)
 
     llm = anthropic_settings.get_llm()
-    completion = await llm.run_prompt(
-        prompt="The {animal} says",
-        data={"animal": "duck"},
-        system_prompt=None,
+    messages = [
+        Message(content="The duck says"),
+    ]
+    completion = await llm.call_single(
+        messages=messages,
         callbacks=[accum],
     )
     assert completion.seconds_to_first_token > 0
@@ -485,8 +432,8 @@ async def test_anthropic_chain(stub_data_dir: Path) -> None:
     assert isinstance(completion.text, str)
     assert completion.cost > 0
 
-    completion = await llm.run_prompt(
-        prompt="The {animal} says", data={"animal": "duck"}, system_prompt=None
+    completion = await llm.call_single(
+        messages=messages,
     )
     assert completion.seconds_to_first_token == 0
     assert completion.seconds_to_last_token > 0
@@ -592,7 +539,29 @@ def test_location_awareness(docs_fixture) -> None:
 
 
 def test_query(docs_fixture) -> None:
-    docs_fixture.query("Is XAI usable in chemistry?")
+    settings = Settings(prompts={"answer_iteration_prompt": None})
+    docs_fixture.query("Is XAI usable in chemistry?", settings=settings)
+
+
+def test_query_with_iteration(docs_fixture) -> None:
+    # we store these results to check that the prompts are OK
+    my_results: list[LLMResult] = []
+    # explicitly set the prompt to use QA iterations
+    settings = Settings()
+    llm = settings.get_llm()
+    llm.llm_result_callback = my_results.append
+    prior_answer = "No, it isn't usable in chemistry."
+    question = "Is XAI usable in chemistry?"
+    prior_session = PQASession(question=question, answer=prior_answer)
+    docs_fixture.query(prior_session, llm_model=llm, settings=settings)
+    assert prior_answer in cast(
+        "str", my_results[-1].prompt[1].content  # type: ignore[union-attr, index]
+    ), "prior answer not in prompt"
+    # run without a prior session to check that the flow works correctly
+    docs_fixture.query(question, llm_model=llm, settings=settings)
+    assert settings.prompts.answer_iteration_prompt[:10] not in cast(  # type: ignore[index]
+        "str", my_results[-1].prompt[1].content  # type: ignore[union-attr, index]
+    ), "prior answer prompt should not be inserted"
 
 
 def test_llmresult_callback(docs_fixture: Docs) -> None:
@@ -608,6 +577,41 @@ def test_llmresult_callback(docs_fixture: Docs) -> None:
     assert len(my_results) >= 1, "Expected the callback to append results"
     assert my_results[0].name
     assert my_results[0].session_id
+
+
+@pytest.mark.parametrize(
+    ("llm", "llm_settings"),
+    [
+        pytest.param(
+            "deepseek/deepseek-reasoner",
+            {
+                "model_list": [
+                    {
+                        "model_name": "deepseek/deepseek-reasoner",
+                        "litellm_params": {
+                            "model": "deepseek/deepseek-reasoner",
+                            "api_base": "https://api.deepseek.com/v1",
+                        },
+                    }
+                ]
+            },
+            id="deepseek-reasoner",
+        ),
+        pytest.param(
+            "openrouter/deepseek/deepseek-r1",
+            {},
+            id="openrouter-deepseek",
+        ),
+    ],
+)
+@pytest.mark.vcr(match_on=[*VCR_DEFAULT_MATCH_ON, "body"])
+def test_get_reasoning(docs_fixture: Docs, llm: str, llm_settings: dict) -> None:
+    settings = Settings(
+        llm=llm,
+        llm_settings=llm_settings,
+    )
+    response = docs_fixture.query("What is XAI?", settings=settings)
+    assert response.answer_reasoning
 
 
 def test_duplicate(stub_data_dir: Path) -> None:
@@ -766,18 +770,36 @@ def test_hybrid_embedding(stub_data_dir: Path, vector_store: type[VectorStore]) 
 
 
 def test_custom_llm(stub_data_dir: Path) -> None:
-    from llmclient import Chunk
-
     class StubLLMModel(LLMModel):
-        name: str = "myllm"
+        name: str = "custom/myllm"
 
-        async def acomplete(self, prompt: str) -> Chunk:  # noqa: ARG002
-            return Chunk(text="Echo", prompt_tokens=1, completion_tokens=1)
+        async def acompletion(
+            self, messages: list[Message], **kwargs  # noqa: ARG002
+        ) -> list[LLMResult]:
+            return [
+                LLMResult(
+                    model=self.name,
+                    text="Echo",
+                    prompt=messages,
+                    prompt_count=1,
+                    completion_count=1,
+                )
+            ]
 
-        async def acomplete_iter(
-            self, prompt: str  # noqa: ARG002
-        ) -> AsyncIterable[Chunk]:
-            yield Chunk(text="Echo", prompt_tokens=1, completion_tokens=1)
+        @rate_limited
+        async def acompletion_iter(
+            self, messages: list[Message], **kwargs  # noqa: ARG002
+        ) -> AsyncIterable[LLMResult]:
+            yield LLMResult(
+                model=self.name,
+                text="Echo",
+                prompt=messages,
+                prompt_count=1,
+                completion_count=1,
+            )
+
+        async def check_rate_limit(self, token_count: float, **kwargs) -> None:
+            """This is a dummy check."""
 
     docs = Docs()
     docs.add(
@@ -946,7 +968,8 @@ async def test_partly_embedded_texts(defer_embeddings: bool) -> None:
     assert len(docs.texts_index.texts_hashes) == len(texts_to_add)
 
 
-# some of the stored requests will be identical on method, scheme, host, port, path, and query (if defined)
+# some of the stored requests will be identical on
+# method, scheme, host, port, path, and query (if defined)
 # body will always be different between requests
 # adding body so that vcr correctly match the right request with its response.
 @pytest.mark.vcr(match_on=[*VCR_DEFAULT_MATCH_ON, "body"])
@@ -1229,6 +1252,10 @@ def test_case_insensitive_matching():
     assert strings_similarity("A B c d e", "a b c f") == 0.5
 
 
+@pytest.mark.flaky(
+    reruns=3,  # pytest-xdist can lead to >1 DeprecationWarning
+    only_rerun=["AssertionError"],
+)
 def test_answer_rename(recwarn) -> None:
     # TODO: delete this test in v6
     answer = Answer(question="")
@@ -1415,7 +1442,7 @@ async def test_partitioning_fn_docs(use_partition: bool) -> None:
     await docs._build_texts_index(settings.get_embedding_model())
 
     partitioned_texts, _ = cast(
-        tuple[Sequence[Text], list[float]],
+        "tuple[Sequence[Text], list[float]]",
         await docs.texts_index.partitioned_similarity_search(
             "What do I like?",
             k=4,
@@ -1425,7 +1452,7 @@ async def test_partitioning_fn_docs(use_partition: bool) -> None:
     )
 
     default_texts, _ = cast(
-        tuple[Sequence[Text], list[float]],
+        "tuple[Sequence[Text], list[float]]",
         await docs.texts_index.similarity_search(
             "What do I like?", k=4, embedding_model=settings.get_embedding_model()
         ),
@@ -1471,3 +1498,237 @@ async def test_partitioning_fn_docs(use_partition: bool) -> None:
         assert all(
             "don't" not in c.text.text for c in session.contexts
         ), "None of the 'don't like X' statements should be included"
+
+
+class TestLLMParseJson:
+    """Tests for extracting JSON strings from LLM Response and ensuring proper formatting."""
+
+    @pytest.mark.parametrize(
+        "input_text",
+        [
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help\n\n"
+                '{\n"summary": "Lorem Ipsum",\n"relevance_score": 8\n}'
+                "\n\nHope this helps!",
+                id="json-newlines-no-markdown-block",
+            ),
+            pytest.param(
+                "<think> Thinking </think>"
+                '```json\n{\n"summary": "Lorem Ipsum",\n"relevance_score": 8\n}\n```'
+                "\n\nHope this helps!",
+                id="json-newlines-with-markdown-block",
+            ),
+            pytest.param(
+                "<think> Thinking </think>"
+                '```json {    "summary": "Lorem Ipsum",    "relevance_ score": 8 } ```',
+                id="removing-think-tags",
+            ),
+            pytest.param(
+                "I am here to help"
+                '{   "summary": "Lorem Ipsum",   "relevance_score": 8 }'
+                "Hope this helps!",
+                id="removing-intro-outro-text",
+            ),
+            pytest.param(
+                "I am here to help"
+                '{\n   "summary": "Lorem Ipsum",\n   "relevance_score": "8" \n}'
+                "Hope this helps!",
+                id="with-newlines-and-quotes",
+            ),
+        ],
+    )
+    def test_basic_json_extraction(self, input_text: str) -> None:
+        output = {"summary": "Lorem Ipsum", "relevance_score": 8}
+        assert llm_parse_json(input_text) == output
+
+    @pytest.mark.parametrize(
+        "input_text",
+        [
+            pytest.param(
+                '<think> Thinking </think>\n I am here to help\n\n{\n"summary": "Lorem'
+                ' Ipsum\n\ndolor sit amet",\n"relevance_score": 8\n}\nHope this helps!',
+                id="handling-newlines-in-json-values",
+            ),
+        ],
+    )
+    def test_handling_newlines(self, input_text: str) -> None:
+        output = {"summary": "Lorem Ipsum\n\ndolor sit amet", "relevance_score": 8}
+        assert llm_parse_json(input_text) == output
+
+    @pytest.mark.parametrize(
+        "input_text",
+        [
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help"
+                '```json {   "summary": "Lorem Ipsum",   "relevance_score": 7.6 } ```'
+                "Hope this helps!",
+                id="float-relevance-score",
+            ),
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help"
+                '```json {   "summary": "Lorem Ipsum",   "relevance_score": "8" } ```'
+                "Hope this helps!",
+                id="string-relevance-score",
+            ),
+            pytest.param(
+                '<think> Thinking </think>I am here to help```json {   "summary":'
+                ' "Lorem Ipsum",   "relevance_score": "8/10" } ```Hope this helps!',
+                id="string-relevance-score-fraction-1",
+            ),
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help"
+                '```json {   "summary": "Lorem Ipsum",   "relevance_score": "4/5" } ```'
+                "Hope this helps!",
+                id="string-relevance-score-fraction-2",
+            ),
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help"
+                '```json {   "summary": "Lorem Ipsum",   "relevance_score": 8/10 } ```'
+                "Hope this helps!",
+                id="non-string-relevance-score-fraction-3",
+            ),
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help"
+                '```json {   "summary": "Lorem Ipsum",   "relevance_score": 4/5 } ```'
+                "Hope this helps!",
+                id="non-string-relevance-score-fraction-4",
+            ),
+        ],
+    )
+    def test_relevance_score_parsing(self, input_text: str) -> None:
+        output = {"summary": "Lorem Ipsum", "relevance_score": 8}
+        assert llm_parse_json(input_text) == output
+
+    @pytest.mark.parametrize(
+        "input_text",
+        [
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help."
+                '```json {    "summary": "Lorem Ipsum",    "relevance-score": 8 } ```'
+                "Hope this helps!",
+                id="fixing-relevance-score-key-1",
+            ),
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help. "
+                '```json {    "summary": "Lorem Ipsum",    "relevance_ score": 8 } ```'
+                "Hope this helps!",
+                id="fixing-relevance-score-key-2",
+            ),
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help."
+                '```json {    "summary": "Lorem Ipsum",    "score": 8 } ```'
+                "Hope this helps!",
+                id="fixing-relevance-score-key-3",
+            ),
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help."
+                '```json {    "summary": "Lorem Ipsum",    "relevance score": 8 } ```'
+                "Hope this helps!",
+                id="fixing-relevance-score-key-4",
+            ),
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help."
+                '```json {    "summary": "Lorem Ipsum",    "relevance": 8 } ```'
+                "Hope this helps!",
+                id="fixing-relevance-score-key-5",
+            ),
+        ],
+    )
+    def test_json_keys(self, input_text: str) -> None:
+        output = {"summary": "Lorem Ipsum", "relevance_score": 8}
+        assert llm_parse_json(input_text) == output
+
+    @pytest.mark.parametrize(
+        "input_text",
+        [
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help."
+                '{   "summary": "Lorem Ipsum",   "relevance_score": 8, }'
+                "Hope this helps!",
+                id="fixing-broken-json-formatting-in-string-comma-1",
+            ),
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help."
+                '{   "summary": "Lorem Ipsum", ,  "relevance_score": 8 }'
+                "Hope this helps!",
+                id="fixing-broken-json-formatting-in-string-comma-2",
+            ),
+            pytest.param(
+                "<think> Thinking </think>"
+                "I am here to help."
+                '{ ,  "summary": "Lorem Ipsum",  "relevance_score": 8 }'
+                "Hope this helps!",
+                id="fixing-broken-json-formatting-in-string-comma-3",
+            ),
+        ],
+    )
+    def test_json_broken_formatting(self, input_text: str) -> None:
+        output = {"summary": "Lorem Ipsum", "relevance_score": 8}
+        assert llm_parse_json(input_text) == output
+
+    @pytest.mark.parametrize(
+        "input_text",
+        [
+            pytest.param(
+                "<think> Thinking </think>Lorem Ipsum. Hope this helps!",
+                id="non-json-string-with-think-tags",
+            ),
+            pytest.param(
+                "Lorem Ipsum. Hope this helps!",
+                id="non-json-string-no-think-tags",
+            ),
+        ],
+    )
+    def test_fallback_non_json(self, input_text: str) -> None:
+        output = {"summary": "Lorem Ipsum. Hope this helps!"}
+        assert llm_parse_json(input_text) == output
+
+    @pytest.mark.parametrize(
+        ("input_text", "expected_output"),
+        [
+            ('{"example": "\\json"}', {"example": "\\json"}),
+            ('{"example": "this is a \\"json\\""}', {"example": 'this is a "json"'}),
+        ],
+    )
+    def test_llm_parse_json_with_escaped_characters(self, input_text, expected_output):
+        assert llm_parse_json(input_text) == expected_output
+
+    @pytest.mark.parametrize(
+        "input_text",
+        [
+            pytest.param(
+                '{\n  "summary": "An excerpt with "quoted stuff" or "maybe more." More'
+                ' stuff (with parenthesis).",\n  "relevance_score": "8"\n}'
+            ),
+        ],
+    )
+    def test_llm_subquotes_and_newlines(self, input_text: str) -> None:
+        output = {
+            "summary": (
+                'An excerpt with "quoted stuff" or "maybe more." More stuff (with'
+                " parenthesis)."
+            ),
+            "relevance_score": 8,
+        }
+        assert llm_parse_json(input_text) == output
+
+
+def test_maybe_get_date():
+    assert maybe_get_date("2023-01-01") == datetime(2023, 1, 1)
+    assert maybe_get_date("2023-01-31 14:30:00") == datetime(2023, 1, 31, 14, 30)
+    assert maybe_get_date(datetime(2023, 1, 1)) == datetime(2023, 1, 1)
+    assert maybe_get_date("foo") is None
+    assert maybe_get_date("") is None
